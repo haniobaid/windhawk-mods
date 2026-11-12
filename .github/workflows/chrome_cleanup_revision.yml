@@ -1,0 +1,91 @@
+name: Chrome cleanup revision checks
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - mods/chrome-clear-on-exit-keep-sites.wh.cpp
+      - tests/chrome-cleanup/**
+      - .github/workflows/chrome_cleanup_revision.yml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  compile-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.6.1', '1.7.3', '2.0.0-alpha.8']
+    steps:
+      - name: Checkout test branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Restore Windhawk
+        id: cache-windhawk
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/windhawk
+          key: v1-${{ runner.os }}-${{ matrix.version }}
+      - name: Extract Windhawk
+        if: steps.cache-windhawk.outputs.cache-hit != 'true'
+        run: |
+          if [[ "${{ matrix.version }}" == 1.* ]]; then
+            release_tag="v${{ matrix.version }}"
+            installer_args=''
+          else
+            release_tag="${{ matrix.version }}"
+            installer_args='/DEVTOOLS'
+          fi
+          installer_url="https://github.com/ramensoftware/windhawk/releases/download/$release_tag/windhawk_setup.exe"
+          installer_path="${{ runner.temp }}/windhawk_setup.exe"
+          curl --fail -L "$installer_url" -o "$installer_path"
+          extract_path="${{ runner.temp }}\windhawk"
+          MSYS_NO_PATHCONV=1 "$installer_path" /S /PORTABLE $installer_args "/D=$extract_path"
+      - name: Compile submitted mod using official compatibility commands
+        run: |
+          mod_file='mods/chrome-clear-on-exit-keep-sites.wh.cpp'
+          windhawk_path="${{ runner.temp }}\windhawk"
+          if [[ "${{ matrix.version }}" == 1.* ]]; then
+            python -u scripts/compile_mod.py -w "$windhawk_path" \
+              -f "$mod_file" \
+              -o32 "${{ runner.temp }}\mod_32.dll" \
+              -o64 "${{ runner.temp }}\mod_64.dll" \
+              -oarm64 "${{ runner.temp }}\mod_arm64.dll"
+          else
+            cli="$windhawk_path\windhawk-cli.exe"
+            result="${{ runner.temp }}/compile_result.json"
+            if ! MSYS_NO_PATHCONV=1 "$cli" --json \
+              mod install --disabled --arch all --strict --file "$mod_file" \
+              > "$result"; then
+              jq -r '"::error::\(.error.code): \(.error.message)"' "$result" \
+                || cat "$result"
+              exit 1
+            fi
+            if jq -e '.data.warnings' "$result" > /dev/null; then
+              echo "::error::The mod compiled with warnings"
+              exit 1
+            fi
+          fi
+      - name: Run native Windows behavior tests
+        if: matrix.version == '1.7.3'
+        run: |
+          python -u tests/chrome-cleanup/run_native_tests.py \
+            --windhawk-dir "${{ runner.temp }}\windhawk" \
+            --source mods/chrome-clear-on-exit-keep-sites.wh.cpp \
+            --output "${{ runner.temp }}\chrome-cleanup-tests"
