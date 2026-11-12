@@ -40,8 +40,10 @@ def main() -> None:
         raise RuntimeError(f"Windhawk compiler missing: {compiler}")
     args.output.mkdir(parents=True, exist_ok=True)
     source_bytes = args.source.read_bytes()
-    print("Submitted source SHA256:", hashlib.sha256(source_bytes).hexdigest())
-    source = source_bytes.decode("utf-8")
+    print("Checked-out source SHA256:", hashlib.sha256(source_bytes).hexdigest())
+    source = source_bytes.decode("utf-8").replace("\r\n", "\n")
+    print("Submitted source SHA256 (normalized LF):",
+          hashlib.sha256(source.encode("utf-8")).hexdigest())
     modules = {
         "TRANSIENT_POLICY_OVERLAY": "policy_overlay.inc",
         "KEEP_SITE_SETTINGS": "mod_settings.inc",

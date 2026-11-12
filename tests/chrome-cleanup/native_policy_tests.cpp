@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -22,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -31,14 +33,49 @@
 #include <utility>
 #include <vector>
 
+// Fault injection for a tracked relative-open bookkeeping allocation. The
+// native RegOpenKeyExW call allocates through Windows, not global C++ new.
+std::atomic<bool> g_testFailNextAllocation{false};
+void* operator new(size_t size) {
+    if (g_testFailNextAllocation.exchange(false)) {
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(size ? size : 1)) {
+        return memory;
+    }
+    throw std::bad_alloc();
+}
+void* operator new[](size_t size) {
+    return ::operator new(size);
+}
+void operator delete(void* memory) noexcept {
+    std::free(memory);
+}
+void operator delete[](void* memory) noexcept {
+    std::free(memory);
+}
+void operator delete(void* memory, size_t) noexcept {
+    std::free(memory);
+}
+void operator delete[](void* memory, size_t) noexcept {
+    std::free(memory);
+}
+
 std::wstring g_testStorage;
 std::vector<std::wstring> g_testKeepSites;
 
 void Wh_Log(PCWSTR format, ...) {
     wchar_t buffer[2048]{};
+    // Windhawk uses Microsoft's wide-format %s convention. This harness is
+    // compiled against the MinGW standard formatter, which uses %ls instead.
+    std::wstring nativeFormat(format);
+    for (size_t offset = 0; (offset = nativeFormat.find(L"%s", offset)) != std::wstring::npos;) {
+        nativeFormat.replace(offset, 2, L"%ls");
+        offset += 3;
+    }
     va_list args;
     va_start(args, format);
-    vswprintf(buffer, std::size(buffer), format, args);
+    vswprintf(buffer, std::size(buffer), nativeFormat.c_str(), args);
     va_end(args);
     fputws(L"MOD: ", stderr);
     fputws(buffer, stderr);
@@ -325,6 +362,11 @@ static void TestOverlay() {
         TestRequire(RegQueryValueExW(view.key, L"DefaultCookiesSetting", nullptr,
                                      &type, &shortValue, &bytes) == ERROR_MORE_DATA &&
                         bytes == sizeof(DWORD), "Native short-buffer semantics");
+        const DWORD attemptedWrite = 7;
+        TestRequire(RegSetValueExW(view.key, L"UnexpectedWrite", 0, REG_DWORD,
+                                   reinterpret_cast<const BYTE*>(&attemptedWrite),
+                                   sizeof(attemptedWrite)) == ERROR_ACCESS_DENIED,
+                    "Returned KEY_READ handle cannot write private policies");
     }
     TestRequire(TestMissingValue(genuine.key, L"DefaultCookiesSetting") &&
                     TestList(genuine.key, L"ClearBrowsingDataOnExitList").empty() &&
@@ -358,6 +400,35 @@ static void TestOverlay() {
                     "Relative child retains snapshot after root close");
     }
     std::puts("PASS relative native child lifetime after root close");
+
+    {
+        auto parent = TestOpen(HKEY_CURRENT_USER, kTestPolicyPath, true);
+        const auto clientCount = g_overlayState->clients.size();
+        Wh_Log(L"Testing tracked child allocation failure.");
+        DWORD nativeHandlesBefore{}, nativeHandlesAfter{};
+        TestRequire(GetProcessHandleCount(GetCurrentProcess(), &nativeHandlesBefore) != FALSE,
+                    "Count handles before bookkeeping failure");
+        const HKEY sentinel = reinterpret_cast<HKEY>(static_cast<uintptr_t>(0x12345));
+        HKEY child = sentinel;
+        g_testFailNextAllocation = true;
+        const auto result = RegOpenKeyExW_Hook(parent.key, L"Recommended", 0,
+                                               KEY_READ, &child);
+        const bool faultWasConsumed = !g_testFailNextAllocation.exchange(false);
+        TestRequire(GetProcessHandleCount(GetCurrentProcess(), &nativeHandlesAfter) != FALSE,
+                    "Count handles after bookkeeping failure");
+        TestRequire(faultWasConsumed && result == ERROR_NOT_ENOUGH_MEMORY,
+                    "Tracked child allocation failure propagated safely");
+        TestRequire(child == sentinel, "Failed tracked child handle never published");
+        TestRequire(g_overlayState->clients.size() == clientCount,
+                    "Tracked child failure leaves client table unchanged");
+        TestRequire(nativeHandlesAfter == nativeHandlesBefore,
+                    "Temporary native child handle closed after bookkeeping failure");
+        TestOverlayValues(parent.key, keepA);
+        auto retry = TestOpen(parent.key, L"Recommended", true);
+        TestRequire(TestString(retry.key, L"HomepageLocation") == L"about:blank",
+                    "Relative child succeeds after allocation failure");
+    }
+    std::puts("PASS relative-open allocation failure closes native child and preserves parent");
 
     SetOverlaySites(&keepA);
     TestSetDword(genuine.key, L"DefaultCookiesSetting", 2);
@@ -398,22 +469,52 @@ static void TestOverlay() {
     std::puts("PASS user/machine/list conflicts and recovery when original conflicts disappear");
 
     {
-        // More than the documented 4 MiB snapshot budget: fail safely to the
-        // genuine registry view rather than hiding policies or truncating them.
-        std::vector<BYTE> oversized(4 * 1024 * 1024 + 1, 0x2a);
-        TestCheck(RegSetValueExW(genuine.key, L"LargeUnrelatedPolicy", 0, REG_BINARY,
-                                oversized.data(), static_cast<DWORD>(oversized.size())),
-                  "Write oversized fixture value");
+        // Exceed 4 MiB in aggregate, using small native registry cells. A
+        // single multi-megabyte value isn't supported by some volatile hives.
+        std::vector<BYTE> oversized(4096, 0x2a);
+        for (unsigned index = 0; index < 1024; ++index) {
+            const auto name = L"LargeUnrelatedPolicy" + std::to_wstring(index);
+            TestCheck(RegSetValueExW(genuine.key, name.c_str(), 0, REG_BINARY,
+                                    oversized.data(), static_cast<DWORD>(oversized.size())),
+                      "Write aggregate-size fixture value");
+        }
         auto fallback = TestOpen(HKEY_CURRENT_USER, kTestPolicyPath, true);
         TestRequire(TestMissingValue(fallback.key, L"DefaultCookiesSetting"),
                     "Copy limit causes genuine-policy fallback");
         DWORD bytes{};
-        TestCheck(RegQueryValueExW(fallback.key, L"LargeUnrelatedPolicy", nullptr,
+        TestCheck(RegQueryValueExW(fallback.key, L"LargeUnrelatedPolicy1023", nullptr,
                                   nullptr, nullptr, &bytes), "Oversized genuine value visible");
         TestRequire(bytes == oversized.size(), "Oversized genuine value not truncated");
-        TestCheck(RegDeleteValueW(genuine.key, L"LargeUnrelatedPolicy"), "Remove oversized fixture");
+        for (unsigned index = 0; index < 1024; ++index) {
+            const auto name = L"LargeUnrelatedPolicy" + std::to_wstring(index);
+            TestCheck(RegDeleteValueW(genuine.key, name.c_str()), "Remove aggregate-size fixture");
+        }
     }
     std::puts("PASS bounded clone failure preserves original values with no synthetic policy");
+
+    {
+        SetOverlaySites(nullptr);
+        ShutdownOverlay();
+        const auto goodStorage = g_testStorage;
+        g_testStorage += L"\\missing-parent\\unavailable";
+        TestRequire(InitializeOverlayStorage(), "Initialize without eager storage I/O");
+        TestRequire(SetOverlaySites(&keepA), "Accept settings before lazy storage attempt");
+        {
+            auto fallback = TestOpen(HKEY_CURRENT_USER, kTestPolicyPath, true);
+            TestRequire(TestMissingValue(fallback.key, L"DefaultCookiesSetting"),
+                        "Unavailable storage falls back to genuine policies");
+            TestRequire(TestDword(fallback.key, L"UnrelatedPolicy") == 42,
+                        "Unavailable storage preserves unrelated policy");
+        }
+        SetOverlaySites(nullptr);
+        ShutdownOverlay();
+        g_testStorage = goodStorage;
+        TestRequire(InitializeOverlayStorage(), "Reinitialize after storage failure");
+        TestRequire(SetOverlaySites(&keepA), "Restore enabled configuration");
+        auto recovered = TestOpen(HKEY_CURRENT_USER, kTestPolicyPath, true);
+        TestOverlayValues(recovered.key, keepA);
+    }
+    std::puts("PASS unavailable storage fails safely and a later module restart recovers");
 
     {
         std::atomic<unsigned> failures{0};

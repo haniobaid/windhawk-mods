@@ -63,8 +63,10 @@ processes. It does not change Chrome's real policy registry keys or profile file
 A private application hive under Windhawk's own mod storage provides genuine
 Windows registry handles; the supplied values live in volatile keys. Files use a
 separate private directory for each user/process instance and are never reused as
-configuration. Any file that remains after a crash is inactive and belongs to
-Windhawk's removable mod storage. There is no recovery journal to back up.
+configuration. Completed reads normally remove their backing files. Files can
+remain if a process exits during a read, cleanup fails, or Chrome still holds a
+key during mod unload; those files are inactive and remain within Windhawk's
+removable mod storage. There is no recovery journal to back up.
 
 ## Scope and limitations
 
@@ -679,12 +681,15 @@ void OverlayReportFailure(const wchar_t* action, LSTATUS error) noexcept {
 LSTATUS WINAPI RegOpenKeyExW_Hook(HKEY key, LPCWSTR subkey, DWORD options,
                                  REGSAM access, PHKEY result) {
     if (g_overlayBypass) return OverlayNativeOpen(key, subkey, options, access, result);
+    bool trackedParent = false;
+    LSTATUS failure = ERROR_NOT_ENOUGH_MEMORY;
     try {
         OverlayLock lock;
         OverlayBypass bypass;
         if (g_overlayState) {
             auto parent = g_overlayState->clients.find(key);
             if (parent != g_overlayState->clients.end()) {
+                trackedParent = true;
                 if (!result) return ERROR_INVALID_PARAMETER;
                 OverlayKey opened;
                 LSTATUS status = OverlayNativeOpen(key, subkey, options, access, &opened.value);
@@ -707,10 +712,14 @@ LSTATUS WINAPI RegOpenKeyExW_Hook(HKEY key, LPCWSTR subkey, DWORD options,
             }
         }
     } catch (const OverlayError& error) {
+        failure = error.code;
         OverlayReportFailure(error.action, error.code);
     } catch (...) {
         OverlayReportFailure(L"Cannot allocate a transient Chrome policy view", ERROR_NOT_ENOUGH_MEMORY);
     }
+    // A relative child must share its parent's lifetime. If bookkeeping failed,
+    // its RAII handle is already closed; never return an untracked replacement.
+    if (trackedParent) return failure;
     OverlayBypass bypass;
     return OverlayNativeOpen(key, subkey, options, access, result);
 }
