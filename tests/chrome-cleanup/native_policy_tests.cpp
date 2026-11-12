@@ -593,8 +593,8 @@ static void TestRefresh() {
     TestRequire(UnregisterGPNotification_Hook(event) != FALSE &&
                     GetLastError() == 124, "Unregister forwards and preserves last error");
     RequestPolicyRefresh();
-    TestRequire(WaitForSingleObject(event, 0) == WAIT_OBJECT_0,
-                "One registration remains after first unregister");
+    TestRequire(WaitForSingleObject(event, 0) == WAIT_TIMEOUT,
+                "One successful unregister removes the event registration");
     ResetEvent(event);
     TestRequire(UnregisterGPNotification_Hook(event) != FALSE, "Final unregister");
     RequestPolicyRefresh();
